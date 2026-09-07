@@ -8,6 +8,15 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
+
+	"github.com/xtls/xray-core/app/proxyman/command"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/proxy/trojan"
+	"github.com/xtls/xray-core/proxy/vless"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"panel/config"
 	"panel/database"
@@ -78,8 +87,119 @@ func (m *Manager) startLocked() error {
 	return nil
 }
 
-func (m *Manager) generateConfigLocked() error {
+// AddClient adds a client to the running Xray process without restarting it.
+func (m *Manager) AddClient(protocolName, email, credential string) error {
+	return m.alterClient(protocolName, email, credential, true)
+}
 
+// RemoveClient removes a client from the running Xray process without restarting it.
+func (m *Manager) RemoveClient(protocolName, email string) error {
+	return m.alterClient(protocolName, email, "", false)
+}
+
+func (m *Manager) alterClient(protocolName, email, credential string, add bool) error {
+	inboundTag, err := inboundTagForProtocol(protocolName)
+	if err != nil {
+		return err
+	}
+
+	conn, err := grpc.Dial(
+		"127.0.0.1:10085",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to connect to Xray API: %w", err)
+	}
+	defer conn.Close()
+
+	client := command.NewHandlerServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var operation *serial.TypedMessage
+
+	if add {
+		account, err := accountForProtocol(protocolName, credential)
+		if err != nil {
+			return err
+		}
+
+		operation = serial.ToTypedMessage(&command.AddUserOperation{
+			User: &protocol.User{
+				Email:   email,
+				Level:   0,
+				Account: account,
+			},
+		})
+	} else {
+		operation = serial.ToTypedMessage(&command.RemoveUserOperation{
+			Email: email,
+		})
+	}
+
+	_, err = client.AlterInbound(
+		ctx,
+		&command.AlterInboundRequest{
+			Tag:       inboundTag,
+			Operation: operation,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"Xray hot update failed for %s client %s: %w",
+			protocolName,
+			email,
+			err,
+		)
+	}
+
+	if add {
+		log.Printf(
+			"Xray hot update: added %s client %s",
+			protocolName,
+			email,
+		)
+	} else {
+		log.Printf(
+			"Xray hot update: removed %s client %s",
+			protocolName,
+			email,
+		)
+	}
+
+	return nil
+}
+
+func inboundTagForProtocol(protocolName string) (string, error) {
+	switch protocolName {
+	case "vless":
+		return "vless-ws", nil
+	case "trojan":
+		return "trojan-ws", nil
+	default:
+		return "", fmt.Errorf("unsupported protocol: %s", protocolName)
+	}
+}
+
+func accountForProtocol(protocolName, credential string) (*serial.TypedMessage, error) {
+	switch protocolName {
+	case "vless":
+		return serial.ToTypedMessage(&vless.Account{
+			Id: credential,
+		}), nil
+
+	case "trojan":
+		return serial.ToTypedMessage(&trojan.Account{
+			Password: credential,
+		}), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported protocol: %s", protocolName)
+	}
+}
+
+func (m *Manager) generateConfigLocked() error {
 	rows, err := database.DB.Query(`
 		SELECT id, uuid, password, enabled
 		FROM clients
@@ -88,13 +208,11 @@ func (m *Manager) generateConfigLocked() error {
 	if err != nil {
 		return fmt.Errorf("failed to query clients: %w", err)
 	}
-
 	defer rows.Close()
 
 	var clients []config.Client
 
 	for rows.Next() {
-
 		var (
 			id       int64
 			uuid     string
@@ -102,12 +220,7 @@ func (m *Manager) generateConfigLocked() error {
 			enabled  int
 		)
 
-		if err := rows.Scan(
-			&id,
-			&uuid,
-			&password,
-			&enabled,
-		); err != nil {
+		if err := rows.Scan(&id, &uuid, &password, &enabled); err != nil {
 			return fmt.Errorf("failed to read client: %w", err)
 		}
 
@@ -130,21 +243,15 @@ func (m *Manager) generateConfigLocked() error {
 	}
 
 	var pretty json.RawMessage
-
 	if err := json.Unmarshal(data, &pretty); err != nil {
 		return fmt.Errorf("invalid generated Xray config: %w", err)
 	}
 
-	if err := os.WriteFile(
-		"config/xray.json",
-		data,
-		0644,
-	); err != nil {
+	if err := os.WriteFile("config/xray.json", data, 0644); err != nil {
 		return fmt.Errorf("failed to write Xray config: %w", err)
 	}
 
 	enabledCount := 0
-
 	for _, client := range clients {
 		if client.Enabled {
 			enabledCount++
