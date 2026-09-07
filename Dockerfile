@@ -1,4 +1,4 @@
-FROM golang:1.21-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ FROM alpine:latest
 
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates curl
+RUN apk add --no-cache ca-certificates curl unzip
 
 # Install cloudflared
 RUN curl -L \
@@ -19,11 +19,10 @@ RUN curl -L \
     -o /usr/local/bin/cloudflared \
     && chmod +x /usr/local/bin/cloudflared
 
-# Install Xray
+# Install Xray 26.3.27
 RUN curl -L \
-    https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip \
+    https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip \
     -o /tmp/xray.zip \
-    && apk add --no-cache unzip \
     && unzip /tmp/xray.zip xray -d /usr/local/bin/ \
     && chmod +x /usr/local/bin/xray \
     && rm -f /tmp/xray.zip
