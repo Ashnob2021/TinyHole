@@ -15,7 +15,8 @@ import (
 )
 
 type XrayManager interface {
-	Reload() error
+	AddClient(protocol, email, credential string) error
+	RemoveClient(protocol, email string) error
 }
 
 type TrafficResetter interface {
@@ -92,7 +93,7 @@ func (h *ClientHandler) Create(w http.ResponseWriter, r *http.Request) {
 		password = generatePassword(24)
 	}
 
-	_, err = database.DB.Exec(`
+	result, err := database.DB.Exec(`
 		INSERT INTO clients
 		(
 			name,
@@ -120,11 +121,29 @@ func (h *ClientHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientID, err := result.LastInsertId()
+	if err != nil {
+		http.Error(w, "failed to get created client id", http.StatusInternalServerError)
+		return
+	}
+
 	if h.XrayManager != nil {
-		if err := h.XrayManager.Reload(); err != nil {
+		credential := clientUUID
+		if protocol == "trojan" {
+			credential = password
+		}
+
+		email := fmt.Sprintf("client-%d", clientID)
+
+		if err := h.XrayManager.AddClient(protocol, email, credential); err != nil {
+			_, _ = database.DB.Exec(
+				"DELETE FROM clients WHERE id = ?",
+				clientID,
+			)
+
 			http.Error(
 				w,
-				"client was saved but Xray reload failed: "+err.Error(),
+				"client was not added to Xray: "+err.Error(),
 				http.StatusInternalServerError,
 			)
 			return
@@ -148,25 +167,59 @@ func (h *ClientHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var (
+		protocol string
+		uuid     string
+		password string
+		enabled  int
+	)
+
+	err = database.DB.QueryRow(`
+		SELECT protocol, uuid, password, enabled
+		FROM clients
+		WHERE id = ?
+	`, id).Scan(
+		&protocol,
+		&uuid,
+		&password,
+		&enabled,
+	)
+
+	if err != nil {
+		http.Error(w, "client not found", http.StatusNotFound)
+		return
+	}
+
+	email := fmt.Sprintf("client-%d", id)
+
+	if enabled == 1 && h.XrayManager != nil {
+		if err := h.XrayManager.RemoveClient(protocol, email); err != nil {
+			http.Error(
+				w,
+				"client was not deleted because Xray update failed: "+err.Error(),
+				http.StatusInternalServerError,
+			)
+			return
+		}
+	}
+
 	_, err = database.DB.Exec(
 		"DELETE FROM clients WHERE id = ?",
 		id,
 	)
 
 	if err != nil {
+		// Restore the client in Xray if the database deletion failed.
+		if enabled == 1 && h.XrayManager != nil {
+			credential := uuid
+			if protocol == "trojan" {
+				credential = password
+			}
+			_ = h.XrayManager.AddClient(protocol, email, credential)
+		}
+
 		http.Error(w, "failed to delete client", http.StatusInternalServerError)
 		return
-	}
-
-	if h.XrayManager != nil {
-		if err := h.XrayManager.Reload(); err != nil {
-			http.Error(
-				w,
-				"client was deleted but Xray reload failed: "+err.Error(),
-				http.StatusInternalServerError,
-			)
-			return
-		}
 	}
 
 	dashboardRedirect(w, r)
@@ -215,17 +268,8 @@ func (h *ClientHandler) EditName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.XrayManager != nil {
-		if err := h.XrayManager.Reload(); err != nil {
-			http.Error(
-				w,
-				"name was updated but Xray reload failed: "+err.Error(),
-				http.StatusInternalServerError,
-			)
-			return
-		}
-	}
-
+	// Client name is only stored in the database.
+	// Xray uses client-ID as its stable email, so no Xray update is needed.
 	dashboardRedirect(w, r)
 }
 
@@ -243,13 +287,21 @@ func (h *ClientHandler) ChangeUUID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var protocol string
+	var (
+		protocol string
+		oldUUID  string
+		enabled  int
+	)
 
 	err = database.DB.QueryRow(`
-		SELECT protocol
+		SELECT protocol, uuid, enabled
 		FROM clients
 		WHERE id = ?
-	`, id).Scan(&protocol)
+	`, id).Scan(
+		&protocol,
+		&oldUUID,
+		&enabled,
+	)
 
 	if err != nil {
 		http.Error(w, "client not found", http.StatusNotFound)
@@ -262,6 +314,19 @@ func (h *ClientHandler) ChangeUUID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	newUUID := uuid.New().String()
+	email := fmt.Sprintf("client-%d", id)
+
+	// Remove the old account first.
+	if enabled == 1 && h.XrayManager != nil {
+		if err := h.XrayManager.RemoveClient("vless", email); err != nil {
+			http.Error(
+				w,
+				"failed to remove old UUID from Xray: "+err.Error(),
+				http.StatusInternalServerError,
+			)
+			return
+		}
+	}
 
 	_, err = database.DB.Exec(`
 		UPDATE clients
@@ -270,15 +335,30 @@ func (h *ClientHandler) ChangeUUID(w http.ResponseWriter, r *http.Request) {
 	`, newUUID, id)
 
 	if err != nil {
+		// Restore old account if database update failed.
+		if enabled == 1 && h.XrayManager != nil {
+			_ = h.XrayManager.AddClient("vless", email, oldUUID)
+		}
+
 		http.Error(w, "failed to change UUID", http.StatusInternalServerError)
 		return
 	}
 
-	if h.XrayManager != nil {
-		if err := h.XrayManager.Reload(); err != nil {
+	// Add the new account to the running Xray process.
+	if enabled == 1 && h.XrayManager != nil {
+		if err := h.XrayManager.AddClient("vless", email, newUUID); err != nil {
+
+			_, _ = database.DB.Exec(`
+				UPDATE clients
+				SET uuid = ?
+				WHERE id = ?
+			`, oldUUID, id)
+
+			_ = h.XrayManager.AddClient("vless", email, oldUUID)
+
 			http.Error(
 				w,
-				"UUID was changed but Xray reload failed: "+err.Error(),
+				"UUID was not changed in Xray: "+err.Error(),
 				http.StatusInternalServerError,
 			)
 			return
@@ -302,13 +382,21 @@ func (h *ClientHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var protocol string
+	var (
+		protocol     string
+		oldPassword  string
+		enabled      int
+	)
 
 	err = database.DB.QueryRow(`
-		SELECT protocol
+		SELECT protocol, password, enabled
 		FROM clients
 		WHERE id = ?
-	`, id).Scan(&protocol)
+	`, id).Scan(
+		&protocol,
+		&oldPassword,
+		&enabled,
+	)
 
 	if err != nil {
 		http.Error(w, "client not found", http.StatusNotFound)
@@ -321,6 +409,19 @@ func (h *ClientHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	newPassword := generatePassword(24)
+	email := fmt.Sprintf("client-%d", id)
+
+	// Remove the old account first.
+	if enabled == 1 && h.XrayManager != nil {
+		if err := h.XrayManager.RemoveClient("trojan", email); err != nil {
+			http.Error(
+				w,
+				"failed to remove old password from Xray: "+err.Error(),
+				http.StatusInternalServerError,
+			)
+			return
+		}
+	}
 
 	_, err = database.DB.Exec(`
 		UPDATE clients
@@ -329,15 +430,29 @@ func (h *ClientHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	`, newPassword, id)
 
 	if err != nil {
+		if enabled == 1 && h.XrayManager != nil {
+			_ = h.XrayManager.AddClient("trojan", email, oldPassword)
+		}
+
 		http.Error(w, "failed to change password", http.StatusInternalServerError)
 		return
 	}
 
-	if h.XrayManager != nil {
-		if err := h.XrayManager.Reload(); err != nil {
+	// Add the new account to the running Xray process.
+	if enabled == 1 && h.XrayManager != nil {
+		if err := h.XrayManager.AddClient("trojan", email, newPassword); err != nil {
+
+			_, _ = database.DB.Exec(`
+				UPDATE clients
+				SET password = ?
+				WHERE id = ?
+			`, oldPassword, id)
+
+			_ = h.XrayManager.AddClient("trojan", email, oldPassword)
+
 			http.Error(
 				w,
-				"password was changed but Xray reload failed: "+err.Error(),
+				"password was not changed in Xray: "+err.Error(),
 				http.StatusInternalServerError,
 			)
 			return
@@ -377,6 +492,29 @@ func (h *ClientHandler) SetEnabled(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var (
+		protocol     string
+		clientUUID   string
+		password     string
+		oldEnabled   int
+	)
+
+	err = database.DB.QueryRow(`
+		SELECT protocol, uuid, password, enabled
+		FROM clients
+		WHERE id = ?
+	`, id).Scan(
+		&protocol,
+		&clientUUID,
+		&password,
+		&oldEnabled,
+	)
+
+	if err != nil {
+		http.Error(w, "client not found", http.StatusNotFound)
+		return
+	}
+
 	// Do not allow manually enabling a client whose quota is already reached.
 	if enabled == 1 {
 
@@ -404,6 +542,37 @@ func (h *ClientHandler) SetEnabled(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	email := fmt.Sprintf("client-%d", id)
+
+	// Only change Xray when the state actually changes.
+	if oldEnabled != enabled && h.XrayManager != nil {
+
+		if enabled == 1 {
+			credential := clientUUID
+			if protocol == "trojan" {
+				credential = password
+			}
+
+			if err := h.XrayManager.AddClient(protocol, email, credential); err != nil {
+				http.Error(
+					w,
+					"failed to enable client in Xray: "+err.Error(),
+					http.StatusInternalServerError,
+				)
+				return
+			}
+		} else {
+			if err := h.XrayManager.RemoveClient(protocol, email); err != nil {
+				http.Error(
+					w,
+					"failed to disable client in Xray: "+err.Error(),
+					http.StatusInternalServerError,
+				)
+				return
+			}
+		}
+	}
+
 	result, err := database.DB.Exec(`
 		UPDATE clients
 		SET enabled = ?
@@ -411,6 +580,20 @@ func (h *ClientHandler) SetEnabled(w http.ResponseWriter, r *http.Request) {
 	`, enabled, id)
 
 	if err != nil {
+		// Restore Xray state if the database update failed.
+		if oldEnabled != enabled && h.XrayManager != nil {
+
+			if oldEnabled == 1 {
+				credential := clientUUID
+				if protocol == "trojan" {
+					credential = password
+				}
+				_ = h.XrayManager.AddClient(protocol, email, credential)
+			} else {
+				_ = h.XrayManager.RemoveClient(protocol, email)
+			}
+		}
+
 		http.Error(w, "failed to change client status", http.StatusInternalServerError)
 		return
 	}
@@ -424,17 +607,6 @@ func (h *ClientHandler) SetEnabled(w http.ResponseWriter, r *http.Request) {
 	if affected == 0 {
 		http.Error(w, "client not found", http.StatusNotFound)
 		return
-	}
-
-	if h.XrayManager != nil {
-		if err := h.XrayManager.Reload(); err != nil {
-			http.Error(
-				w,
-				"client status was changed but Xray reload failed: "+err.Error(),
-				http.StatusInternalServerError,
-			)
-			return
-		}
 	}
 
 	dashboardRedirect(w, r)
@@ -462,24 +634,46 @@ func (h *ClientHandler) EditQuota(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var trafficUsed int64
+	var (
+		trafficUsed int64
+		protocol    string
+		clientUUID  string
+		password    string
+		oldEnabled  int
+		oldLimit    int64
+	)
 
 	err = database.DB.QueryRow(`
-		SELECT traffic_used_bytes
+		SELECT
+			traffic_used_bytes,
+			protocol,
+			uuid,
+			password,
+			enabled,
+			traffic_limit_bytes
 		FROM clients
 		WHERE id = ?
-	`, id).Scan(&trafficUsed)
+	`, id).Scan(
+		&trafficUsed,
+		&protocol,
+		&clientUUID,
+		&password,
+		&oldEnabled,
+		&oldLimit,
+	)
 
 	if err != nil {
 		http.Error(w, "client not found", http.StatusNotFound)
 		return
 	}
 
-	enabled := 1
+	newEnabled := 1
 
 	if trafficLimit > 0 && trafficUsed >= trafficLimit {
-		enabled = 0
+		newEnabled = 0
 	}
+
+	email := fmt.Sprintf("client-%d", id)
 
 	_, err = database.DB.Exec(`
 		UPDATE clients
@@ -488,7 +682,7 @@ func (h *ClientHandler) EditQuota(w http.ResponseWriter, r *http.Request) {
 		WHERE id = ?
 	`,
 		trafficLimit,
-		enabled,
+		newEnabled,
 		id,
 	)
 
@@ -497,14 +691,49 @@ func (h *ClientHandler) EditQuota(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.XrayManager != nil {
-		if err := h.XrayManager.Reload(); err != nil {
-			http.Error(
-				w,
-				"quota was updated but Xray reload failed: "+err.Error(),
-				http.StatusInternalServerError,
-			)
-			return
+	// If the quota change changes the enabled state,
+	// update the running Xray process without restarting it.
+	if oldEnabled != newEnabled && h.XrayManager != nil {
+
+		if newEnabled == 1 {
+			credential := clientUUID
+			if protocol == "trojan" {
+				credential = password
+			}
+
+			if err := h.XrayManager.AddClient(protocol, email, credential); err != nil {
+
+				_, _ = database.DB.Exec(`
+					UPDATE clients
+					SET traffic_limit_bytes = ?,
+					    enabled = ?
+					WHERE id = ?
+				`, oldLimit, oldEnabled, id)
+
+				http.Error(
+					w,
+					"quota was updated but Xray could not enable client: "+err.Error(),
+					http.StatusInternalServerError,
+				)
+				return
+			}
+		} else {
+			if err := h.XrayManager.RemoveClient(protocol, email); err != nil {
+
+				_, _ = database.DB.Exec(`
+					UPDATE clients
+					SET traffic_limit_bytes = ?,
+					    enabled = ?
+					WHERE id = ?
+				`, oldLimit, oldEnabled, id)
+
+				http.Error(
+					w,
+					"quota was updated but Xray could not disable client: "+err.Error(),
+					http.StatusInternalServerError,
+				)
+				return
+			}
 		}
 	}
 
@@ -525,6 +754,31 @@ func (h *ClientHandler) ResetTraffic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var (
+		protocol   string
+		clientUUID string
+		password   string
+		oldEnabled int
+	)
+
+	err = database.DB.QueryRow(`
+		SELECT protocol, uuid, password, enabled
+		FROM clients
+		WHERE id = ?
+	`, id).Scan(
+		&protocol,
+		&clientUUID,
+		&password,
+		&oldEnabled,
+	)
+
+	if err != nil {
+		http.Error(w, "client not found", http.StatusNotFound)
+		return
+	}
+
+	email := fmt.Sprintf("client-%d", id)
+
 	_, err = database.DB.Exec(`
 		UPDATE clients
 		SET traffic_used_bytes = 0,
@@ -538,19 +792,33 @@ func (h *ClientHandler) ResetTraffic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.TrafficResetter != nil {
-		h.TrafficResetter.ResetClient(id)
-	}
+	// ResetTraffic always enables the client.
+	if oldEnabled == 0 && h.XrayManager != nil {
 
-	if h.XrayManager != nil {
-		if err := h.XrayManager.Reload(); err != nil {
+		credential := clientUUID
+		if protocol == "trojan" {
+			credential = password
+		}
+
+		if err := h.XrayManager.AddClient(protocol, email, credential); err != nil {
+
+			_, _ = database.DB.Exec(`
+				UPDATE clients
+				SET enabled = ?
+				WHERE id = ?
+			`, oldEnabled, id)
+
 			http.Error(
 				w,
-				"traffic was reset but Xray reload failed: "+err.Error(),
+				"traffic was reset but Xray could not enable client: "+err.Error(),
 				http.StatusInternalServerError,
 			)
 			return
 		}
+	}
+
+	if h.TrafficResetter != nil {
+		h.TrafficResetter.ResetClient(id)
 	}
 
 	dashboardRedirect(w, r)
