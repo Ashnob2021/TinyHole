@@ -16,14 +16,12 @@ type statsResponse struct {
 	Stat []struct {
 		Name  string `json:"name"`
 		Value int64  `json:"value"`
-	} `json:"stat"`
+	}
 }
 
 type TrafficCollector struct {
-	manager *Manager
-
-	mu sync.Mutex
-
+	manager  *Manager
+	mu       sync.Mutex
 	previous map[int64]int64
 }
 
@@ -51,7 +49,6 @@ func (tc *TrafficCollector) Start() {
 }
 
 func (tc *TrafficCollector) collect() {
-
 	rows, err := database.DB.Query(`
 		SELECT id
 		FROM clients
@@ -84,7 +81,6 @@ func (tc *TrafficCollector) collect() {
 	for _, id := range clientIDs {
 
 		up, down, err := queryUserTraffic(id)
-
 		if err != nil {
 			log.Printf(
 				"Traffic stats query failed for client-%d: %v",
@@ -97,7 +93,6 @@ func (tc *TrafficCollector) collect() {
 		current := up + down
 
 		tc.mu.Lock()
-
 		previous := tc.previous[id]
 
 		var delta int64
@@ -128,12 +123,7 @@ func (tc *TrafficCollector) collect() {
 	}
 }
 
-// ResetClient resets the collector's in-memory counter for a client.
-//
-// The next stats value from Xray becomes the new baseline,
-// so old Xray traffic is not added again after a dashboard reset.
 func (tc *TrafficCollector) ResetClient(id int64) {
-
 	up, down, err := queryUserTraffic(id)
 
 	if err != nil {
@@ -158,7 +148,6 @@ func (tc *TrafficCollector) ResetClient(id int64) {
 }
 
 func queryUserTraffic(id int64) (int64, int64, error) {
-
 	email := fmt.Sprintf("client-%d", id)
 
 	cmd := exec.Command(
@@ -171,7 +160,6 @@ func queryUserTraffic(id int64) (int64, int64, error) {
 	)
 
 	output, err := cmd.CombinedOutput()
-
 	if err != nil {
 		return 0, 0, err
 	}
@@ -207,18 +195,22 @@ func (tc *TrafficCollector) applyTraffic(id int64, delta int64) error {
 		used    int64
 		limit   int64
 		enabled int
+		protocol string
 	)
 
 	err := database.DB.QueryRow(`
-		SELECT traffic_used_bytes,
-		       traffic_limit_bytes,
-		       enabled
+		SELECT
+			traffic_used_bytes,
+			traffic_limit_bytes,
+			enabled,
+			protocol
 		FROM clients
 		WHERE id = ?
 	`, id).Scan(
 		&used,
 		&limit,
 		&enabled,
+		&protocol,
 	)
 
 	if err != nil {
@@ -236,10 +228,7 @@ func (tc *TrafficCollector) applyTraffic(id int64, delta int64) error {
 		SET traffic_used_bytes = ?,
 		    last_seen = CURRENT_TIMESTAMP
 		WHERE id = ?
-	`,
-		newUsed,
-		id,
-	)
+	`, newUsed, id)
 
 	if err != nil {
 		return err
@@ -264,10 +253,24 @@ func (tc *TrafficCollector) applyTraffic(id int64, delta int64) error {
 			return err
 		}
 
+		// Remove the client from the running Xray process
+		// without restarting Xray.
 		if tc.manager != nil {
-			if err := tc.manager.Reload(); err != nil {
-				return err
+
+			email := fmt.Sprintf("client-%d", id)
+
+			if err := tc.manager.RemoveClient(protocol, email); err != nil {
+				return fmt.Errorf(
+					"failed to hot-remove client-%d after quota reached: %w",
+					id,
+					err,
+				)
 			}
+
+			log.Printf(
+				"Client %d was hot-removed from Xray after reaching quota.",
+				id,
+			)
 		}
 	}
 
