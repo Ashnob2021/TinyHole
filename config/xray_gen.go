@@ -49,6 +49,7 @@ func GenerateXrayConfig(clients []Client) ([]byte, error) {
 		"api": map[string]interface{}{
 			"tag": "api",
 			"services": []string{
+				"HandlerService",
 				"StatsService",
 			},
 		},
